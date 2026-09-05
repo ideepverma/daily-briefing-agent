@@ -180,7 +180,7 @@ def gather_all():
     tasks = [(topic, url) for topic, urls in FEEDS.items() for url in urls]
 
     print(f"Fetching {len(tasks)} feeds in parallel (budget: {GLOBAL_FETCH_BUDGET_SECONDS}s)...")
-    with cf.ThreadPoolExecutor(max_workers=min(16, len(tasks))) as executor:
+    with cf.ThreadPoolExecutor(max_workers=6) as executor:
         future_to_task = {executor.submit(_fetch_one_feed, topic, url): (topic, url) for topic, url in tasks}
         done, not_done = cf.wait(future_to_task.keys(), timeout=GLOBAL_FETCH_BUDGET_SECONDS)
 
