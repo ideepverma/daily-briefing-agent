@@ -123,12 +123,23 @@ SUBJECT_PREFIX = "[Daily Research Digest]"
 # 2. FETCH
 # ---------------------------------------------------------------------------
 
+FEED_FETCH_TIMEOUT = 8  # seconds, per feed
+
 def fetch_topic_items(feed_urls):
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=LOOKBACK_HOURS)
     items = []
     for url in feed_urls:
         try:
-            parsed = feedparser.parse(url)
+            # feedparser.parse(url) has no timeout of its own and can hang
+            # forever on a slow/dead server. Fetch the raw bytes ourselves
+            # with an explicit timeout, then hand them to feedparser.
+            resp = requests.get(
+                url,
+                timeout=FEED_FETCH_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0 (daily-briefing-agent)"},
+            )
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
         except Exception as e:
             print(f"  [warn] failed to parse {url}: {e}")
             continue
