@@ -33,6 +33,8 @@ import re
 import ssl
 import smtplib
 import datetime
+import threading
+import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -41,6 +43,34 @@ import requests
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Simple in-memory job status, so /run can return instantly while the real
+# work happens in a background thread. Render's own proxy (and some
+# schedulers) will time out / return an HTML error page long before a
+# 26-feed fetch + Groq call + SMTP send can finish, even if gunicorn itself
+# is configured with a generous --timeout. Returning right away avoids that
+# entirely; check /status to see how the last run went.
+# ---------------------------------------------------------------------------
+job_lock = threading.Lock()
+job_state = {"running": False, "last_result": None, "last_error": None, "started_at": None}
+
+
+def _run_pipeline_in_background():
+    try:
+        result = run_pipeline()
+        with job_lock:
+            job_state["last_result"] = result
+            job_state["last_error"] = None
+    except Exception as e:
+        print(f"[error] pipeline failed: {e}")
+        traceback.print_exc()
+        with job_lock:
+            job_state["last_error"] = str(e)
+            job_state["last_result"] = None
+    finally:
+        with job_lock:
+            job_state["running"] = False
 
 # ---------------------------------------------------------------------------
 # 1. CONFIG — topic -> list of RSS feed URLs (all free, no API key required)
@@ -328,23 +358,46 @@ HOME_PAGE_HTML = """
       const btn = document.getElementById('runBtn');
       const status = document.getElementById('status');
       btn.disabled = true;
-      btn.innerText = 'Running... (10-20s)';
+      btn.innerText = 'Starting...';
       status.className = '';
       status.innerText = '';
       try {
-        const res = await fetch('/run?key={{run_secret}}');
-        const data = await res.json();
-        if (res.ok) {
-          status.className = 'ok';
-          status.innerText = 'Done! ' + (data.items_collected || 0) + ' items collected. Check your email.';
-        } else {
+        const startRes = await fetch('/run?key={{run_secret}}');
+        const startData = await startRes.json();
+        if (!startRes.ok && startRes.status !== 202) {
           status.className = 'err';
-          status.innerText = 'Error: ' + (data.error || 'unknown error');
+          status.innerText = 'Error: ' + (startData.error || 'unknown error');
+          btn.disabled = false;
+          btn.innerText = 'Run Digest Now';
+          return;
         }
+
+        btn.innerText = 'Running... (up to a few minutes)';
+        // Poll /status every few seconds until the background job finishes.
+        const poll = async () => {
+          const res = await fetch('/status?key={{run_secret}}');
+          const data = await res.json();
+          if (data.running) {
+            setTimeout(poll, 4000);
+            return;
+          }
+          if (data.last_error) {
+            status.className = 'err';
+            status.innerText = 'Error: ' + data.last_error;
+          } else if (data.last_result) {
+            status.className = 'ok';
+            status.innerText = 'Done! ' + (data.last_result.items_collected || 0) + ' items collected. Check your email.';
+          } else {
+            status.className = 'err';
+            status.innerText = 'No result found. Try again.';
+          }
+          btn.disabled = false;
+          btn.innerText = 'Run Digest Now';
+        };
+        setTimeout(poll, 4000);
       } catch (e) {
         status.className = 'err';
         status.innerText = 'Network error: ' + e.message;
-      } finally {
         btn.disabled = false;
         btn.innerText = 'Run Digest Now';
       }
@@ -369,12 +422,31 @@ def run_endpoint():
     key = request.args.get("key")
     if not RUN_SECRET or key != RUN_SECRET:
         return jsonify({"error": "unauthorized"}), 401
-    try:
-        result = run_pipeline()
-        return jsonify(result)
-    except Exception as e:
-        print(f"[error] pipeline failed: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    with job_lock:
+        if job_state["running"]:
+            return jsonify({"status": "already_running", "started_at": job_state["started_at"]}), 202
+        job_state["running"] = True
+        job_state["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        job_state["last_result"] = None
+        job_state["last_error"] = None
+
+    thread = threading.Thread(target=_run_pipeline_in_background, daemon=True)
+    thread.start()
+
+    # Return immediately so the request never has a chance to hit Render's
+    # proxy timeout. The actual digest still gets fetched, summarized, and
+    # emailed in the background thread; check /status or your inbox.
+    return jsonify({"status": "started", "started_at": job_state["started_at"]}), 202
+
+
+@app.route("/status")
+def status_endpoint():
+    key = request.args.get("key")
+    if not RUN_SECRET or key != RUN_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    with job_lock:
+        return jsonify(dict(job_state))
 
 
 if __name__ == "__main__":
