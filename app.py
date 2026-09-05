@@ -34,6 +34,7 @@ Environment variables required (set these in Render's dashboard, never in code):
 
 import os
 import re
+import sys
 import datetime
 import threading
 import concurrent.futures as cf
@@ -41,6 +42,13 @@ import concurrent.futures as cf
 import feedparser
 import requests
 from flask import Flask, request, jsonify, render_template_string
+
+# Force real-time logging. Without this, Python buffers print() output when
+# not attached to a terminal (as under gunicorn), so log lines can sit
+# invisible for minutes even though the code has already run/failed —
+# making a fast failure look like an indefinite hang.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
 
@@ -109,8 +117,8 @@ FEEDS = {
 
 MAX_ITEMS_PER_TOPIC = 4
 LOOKBACK_HOURS = 30
-PER_FEED_TIMEOUT = (5, 10)     # (connect timeout, read timeout) in seconds — bounds a single slow feed
-GLOBAL_FETCH_BUDGET_SECONDS = 40  # hard ceiling on the whole fetching phase, no matter how many feeds hang
+PER_FEED_TIMEOUT = (5, 8)     # (connect timeout, read timeout) in seconds — bounds a single slow feed
+GLOBAL_FETCH_BUDGET_SECONDS = 25  # hard ceiling on the whole fetching phase, no matter how many feeds hang
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -265,7 +273,7 @@ def summarize_with_groq(digest_source):
             "temperature": 0.3,
             "max_tokens": 6000,
         },
-        timeout=60,
+        timeout=45,
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
@@ -326,11 +334,18 @@ def send_email(markdown_body):
 # ---------------------------------------------------------------------------
 
 def run_pipeline():
+    t0 = datetime.datetime.now()
+    print(f"[{t0.strftime('%H:%M:%S')}] Pipeline started.")
     digest_source = gather_all()
+    t1 = datetime.datetime.now()
     total_items = sum(len(v) for v in digest_source.values())
-    print(f"Collected {total_items} raw items across {len(digest_source)} topics.")
+    print(f"[{t1.strftime('%H:%M:%S')}] Collected {total_items} raw items across {len(digest_source)} topics. (+{(t1-t0).total_seconds():.1f}s)")
     digest_markdown = summarize_with_groq(digest_source)
+    t2 = datetime.datetime.now()
+    print(f"[{t2.strftime('%H:%M:%S')}] Groq summary done. (+{(t2-t1).total_seconds():.1f}s)")
     send_email(digest_markdown)
+    t3 = datetime.datetime.now()
+    print(f"[{t3.strftime('%H:%M:%S')}] Email sent. (+{(t3-t2).total_seconds():.1f}s, total {(t3-t0).total_seconds():.1f}s)")
     return {"status": "ok", "items_collected": total_items}
 
 # ---------------------------------------------------------------------------
@@ -423,7 +438,9 @@ def run_endpoint():
         try:
             run_pipeline()
         except Exception as e:
+            import traceback
             print(f"[error] pipeline failed: {e}")
+            traceback.print_exc()
 
     threading.Thread(target=background_job, daemon=True).start()
     return jsonify({"status": "started", "message": "Pipeline running in background. Check your email in ~20-30 seconds."})
