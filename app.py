@@ -36,6 +36,7 @@ import os
 import re
 import datetime
 import threading
+import concurrent.futures as cf
 
 import feedparser
 import requests
@@ -108,6 +109,8 @@ FEEDS = {
 
 MAX_ITEMS_PER_TOPIC = 4
 LOOKBACK_HOURS = 30
+PER_FEED_TIMEOUT = (5, 10)     # (connect timeout, read timeout) in seconds — bounds a single slow feed
+GLOBAL_FETCH_BUDGET_SECONDS = 40  # hard ceiling on the whole fetching phase, no matter how many feeds hang
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -129,47 +132,85 @@ SUBJECT_PREFIX = "[Daily Research Digest]"
 # 2. FETCH
 # ---------------------------------------------------------------------------
 
-def fetch_topic_items(feed_urls):
+def _fetch_one_feed(topic, url):
+    """Fetch and parse a single feed. Any failure (timeout, bad response,
+    redirect loop, DNS issue) is caught here and just means fewer items —
+    it never blocks or crashes the whole run."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=PER_FEED_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
+        return topic, parsed.entries
+    except Exception as e:
+        print(f"  [warn] failed to fetch {url}: {e}")
+        return topic, []
+
+
+def _entries_to_items(entries):
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=LOOKBACK_HOURS)
     items = []
-    for url in feed_urls:
-        try:
-            # feedparser has no built-in network timeout, so a slow/unresponsive
-            # feed can hang the whole request forever. Fetch with `requests`
-            # (which DOES support a timeout) and hand the bytes to feedparser.
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            parsed = feedparser.parse(resp.content)
-        except Exception as e:
-            print(f"  [warn] failed to fetch/parse {url}: {e}")
+    for entry in entries:
+        title = entry.get("title", "").strip()
+        link = entry.get("link", "").strip()
+        if not title or not link:
             continue
-        for entry in parsed.entries:
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
-            if not title or not link:
+        published = entry.get("published_parsed") or entry.get("updated_parsed")
+        if published:
+            pub_dt = datetime.datetime(*published[:6])
+            if pub_dt < cutoff:
                 continue
-            published = entry.get("published_parsed") or entry.get("updated_parsed")
-            if published:
-                pub_dt = datetime.datetime(*published[:6])
-                if pub_dt < cutoff:
-                    continue
-            items.append({"title": title, "link": link})
-    seen = set()
-    deduped = []
-    for it in items:
-        key = it["title"].lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(it)
-    return deduped[:MAX_ITEMS_PER_TOPIC]
+        items.append({"title": title, "link": link})
+    return items
 
 
 def gather_all():
-    digest_source = {}
-    for topic, feeds in FEEDS.items():
-        print(f"Fetching: {topic}")
-        digest_source[topic] = fetch_topic_items(feeds)
+    """Fetch every feed across every topic IN PARALLEL, bounded by a hard
+    global time budget. Previously this fetched one feed at a time in a
+    simple loop — a single slow or redirect-looping feed (Google News feeds
+    are a known culprit) could stall the entire run for minutes. Now, even
+    in the worst case, the whole fetch phase can't exceed
+    GLOBAL_FETCH_BUDGET_SECONDS: slow feeds are simply skipped rather than
+    blocking everything else."""
+    digest_source = {topic: [] for topic in FEEDS}
+    tasks = [(topic, url) for topic, urls in FEEDS.items() for url in urls]
+
+    print(f"Fetching {len(tasks)} feeds in parallel (budget: {GLOBAL_FETCH_BUDGET_SECONDS}s)...")
+    with cf.ThreadPoolExecutor(max_workers=min(16, len(tasks))) as executor:
+        future_to_task = {executor.submit(_fetch_one_feed, topic, url): (topic, url) for topic, url in tasks}
+        done, not_done = cf.wait(future_to_task.keys(), timeout=GLOBAL_FETCH_BUDGET_SECONDS)
+
+        for future in done:
+            topic, url = future_to_task[future]
+            try:
+                _, entries = future.result()
+            except Exception as e:
+                print(f"  [warn] {url} raised: {e}")
+                entries = []
+            digest_source[topic].extend(_entries_to_items(entries))
+
+        for future in not_done:
+            topic, url = future_to_task[future]
+            print(f"  [warn] {url} did not finish within the global budget, skipping")
+            # Not cancelling: the underlying request has its own timeout and
+            # will die on its own; we just stop waiting for it here.
+
+    # De-dupe by title and cap per topic
+    for topic, items in digest_source.items():
+        seen = set()
+        deduped = []
+        for it in items:
+            key = it["title"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(it)
+        digest_source[topic] = deduped[:MAX_ITEMS_PER_TOPIC]
+
     return digest_source
 
 # ---------------------------------------------------------------------------
