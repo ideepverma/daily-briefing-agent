@@ -9,68 +9,39 @@ your phone, curl, anything) — "run my agent from anywhere."
 FREE STACK USED:
   - RSS feeds              -> free, no API key
   - Groq API               -> free tier, no credit card, no expiry
-  - Gmail SMTP             -> free (App Password)
+  - Resend Email API       -> free tier, 100 emails/day, no credit card
+                              (used instead of Gmail SMTP because Render's
+                              free web services block outbound SMTP ports
+                              25/465/587 — this uses plain HTTPS instead)
   - Render Web Service     -> free tier (750 instance-hrs/month)
   - cron-job.org           -> free external scheduler that "wakes" this
                               service once a day (Render's own Cron Job
                               product is NOT free, so we avoid it)
 
 Endpoints:
-  GET /                -> health check, confirms the service is alive
-  GET /run?key=SECRET  -> runs the full pipeline once (fetch -> summarize -> email)
+  GET /                -> health check (JSON) or a "Run Digest Now" button page (browser)
+  GET /run?key=SECRET  -> starts the pipeline in the background (fetch -> summarize -> email)
 
 Environment variables required (set these in Render's dashboard, never in code):
   GROQ_API_KEY        - from https://console.groq.com
-  GMAIL_ADDRESS       - your Gmail address
-  GMAIL_APP_PASSWORD  - 16-char App Password (not your real password)
-  DIGEST_TO_ADDRESS   - where to send the digest (can equal GMAIL_ADDRESS)
+  RESEND_API_KEY      - from https://resend.com/api-keys
+  DIGEST_TO_ADDRESS   - MUST be the exact email address you signed up to
+                        Resend with (their free/no-domain tier only allows
+                        sending to your own account email)
   RUN_SECRET          - any random string you invent; required as ?key= to
                         trigger /run, so random internet bots can't spam it
 """
 
 import os
 import re
-import ssl
-import smtplib
 import datetime
 import threading
-import traceback
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import feedparser
 import requests
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
-
-# ---------------------------------------------------------------------------
-# Simple in-memory job status, so /run can return instantly while the real
-# work happens in a background thread. Render's own proxy (and some
-# schedulers) will time out / return an HTML error page long before a
-# 26-feed fetch + Groq call + SMTP send can finish, even if gunicorn itself
-# is configured with a generous --timeout. Returning right away avoids that
-# entirely; check /status to see how the last run went.
-# ---------------------------------------------------------------------------
-job_lock = threading.Lock()
-job_state = {"running": False, "last_result": None, "last_error": None, "started_at": None}
-
-
-def _run_pipeline_in_background():
-    try:
-        result = run_pipeline()
-        with job_lock:
-            job_state["last_result"] = result
-            job_state["last_error"] = None
-    except Exception as e:
-        print(f"[error] pipeline failed: {e}")
-        traceback.print_exc()
-        with job_lock:
-            job_state["last_error"] = str(e)
-            job_state["last_result"] = None
-    finally:
-        with job_lock:
-            job_state["running"] = False
 
 # ---------------------------------------------------------------------------
 # 1. CONFIG — topic -> list of RSS feed URLs (all free, no API key required)
@@ -142,10 +113,15 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-TO_ADDRESS = os.environ.get("DIGEST_TO_ADDRESS", GMAIL_ADDRESS)
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")   # kept only for reference; not used as sender anymore
+TO_ADDRESS = os.environ.get("DIGEST_TO_ADDRESS")
 RUN_SECRET = os.environ.get("RUN_SECRET")
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_URL = "https://api.resend.com/emails"
+# Resend's shared sandbox sender — works with no domain setup, but only
+# delivers to the email address you signed up to Resend with.
+RESEND_FROM_ADDRESS = "Daily Briefing Agent <onboarding@resend.dev>"
 
 SUBJECT_PREFIX = "[Daily Research Digest]"
 
@@ -153,25 +129,19 @@ SUBJECT_PREFIX = "[Daily Research Digest]"
 # 2. FETCH
 # ---------------------------------------------------------------------------
 
-FEED_FETCH_TIMEOUT = 8  # seconds, per feed
-
 def fetch_topic_items(feed_urls):
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=LOOKBACK_HOURS)
     items = []
     for url in feed_urls:
         try:
-            # feedparser.parse(url) has no timeout of its own and can hang
-            # forever on a slow/dead server. Fetch the raw bytes ourselves
-            # with an explicit timeout, then hand them to feedparser.
-            resp = requests.get(
-                url,
-                timeout=FEED_FETCH_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0 (daily-briefing-agent)"},
-            )
+            # feedparser has no built-in network timeout, so a slow/unresponsive
+            # feed can hang the whole request forever. Fetch with `requests`
+            # (which DOES support a timeout) and hand the bytes to feedparser.
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             resp.raise_for_status()
             parsed = feedparser.parse(resp.content)
         except Exception as e:
-            print(f"  [warn] failed to parse {url}: {e}")
+            print(f"  [warn] failed to fetch/parse {url}: {e}")
             continue
         for entry in parsed.entries:
             title = entry.get("title", "").strip()
@@ -206,40 +176,15 @@ def gather_all():
 # 3. SUMMARIZE with Groq (free tier: https://console.groq.com)
 # ---------------------------------------------------------------------------
 
-MAX_TITLE_LEN = 200
-MAX_LINK_LEN = 300
-MAX_PROMPT_CHARS = 14000  # keep well under Groq's request-size limit
-
-
-def _truncate(s, max_len):
-    s = s.strip()
-    return s if len(s) <= max_len else s[: max_len - 1].rstrip() + "…"
-
-
-def build_prompt(digest_source, char_budget=MAX_PROMPT_CHARS):
+def build_prompt(digest_source):
     lines = []
     for topic, items in digest_source.items():
         if not items:
             continue
         lines.append(f"### {topic}")
         for it in items:
-            title = _truncate(it["title"], MAX_TITLE_LEN)
-            link = _truncate(it["link"], MAX_LINK_LEN)
-            lines.append(f"- {title} ({link})")
+            lines.append(f"- {it['title']} ({it['link']})")
     raw_text = "\n".join(lines)
-
-    # Hard safety cap: even after per-field truncation, a large number of
-    # topics/items could still add up to more than the API will accept.
-    # Trim whole lines from the end rather than cutting mid-line/mid-URL.
-    if len(raw_text) > char_budget:
-        kept = []
-        total = 0
-        for line in raw_text.splitlines():
-            if total + len(line) + 1 > char_budget:
-                break
-            kept.append(line)
-            total += len(line) + 1
-        raw_text = "\n".join(kept)
 
     return f"""You are writing a concise daily research digest for a software engineer
 in India who follows AI, software engineering, system design, backend/Java/Spring Boot,
@@ -266,34 +211,21 @@ def summarize_with_groq(digest_source):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY environment variable not set.")
 
-    def call_groq(prompt):
-        resp = requests.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 6000,
-            },
-            timeout=60,
-        )
-        return resp
-
     prompt = build_prompt(digest_source)
-    resp = call_groq(prompt)
-
-    if resp.status_code == 413:
-        # Payload still too large (e.g. an unusually large batch of items) —
-        # retry once with a much smaller character budget instead of failing
-        # the whole run.
-        print("[warn] Groq returned 413, retrying with a smaller prompt")
-        smaller_prompt = build_prompt(digest_source, char_budget=MAX_PROMPT_CHARS // 2)
-        resp = call_groq(smaller_prompt)
-
+    resp = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 6000,
+        },
+        timeout=60,
+    )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -319,25 +251,33 @@ def markdown_to_basic_html(md_text):
 
 
 def send_email(markdown_body):
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        raise RuntimeError("GMAIL_ADDRESS / GMAIL_APP_PASSWORD env vars not set.")
+    """Send via Resend's HTTP email API (not SMTP) — Render's free tier blocks
+    outbound SMTP ports (25/465/587), so a plain HTTPS API call is required."""
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY environment variable not set.")
+    if not TO_ADDRESS:
+        raise RuntimeError("DIGEST_TO_ADDRESS environment variable not set.")
 
     today = datetime.date.today().strftime("%d %b %Y")
     subject = f"{SUBJECT_PREFIX} {today}"
+    html_body = markdown_to_basic_html(markdown_body)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = GMAIL_ADDRESS
-    msg["To"] = TO_ADDRESS
-    msg.attach(MIMEText(markdown_body, "plain"))
-    msg.attach(MIMEText(markdown_to_basic_html(markdown_body), "html"))
-
-    context = ssl.create_default_context()
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls(context=context)
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, TO_ADDRESS, msg.as_string())
-
+    resp = requests.post(
+        RESEND_URL,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": RESEND_FROM_ADDRESS,
+            "to": [TO_ADDRESS],
+            "subject": subject,
+            "text": markdown_body,
+            "html": html_body,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
     print(f"Email sent to {TO_ADDRESS} with subject: {subject}")
 
 # ---------------------------------------------------------------------------
@@ -396,46 +336,23 @@ HOME_PAGE_HTML = """
       const btn = document.getElementById('runBtn');
       const status = document.getElementById('status');
       btn.disabled = true;
-      btn.innerText = 'Starting...';
+      btn.innerText = 'Running... (10-20s)';
       status.className = '';
       status.innerText = '';
       try {
-        const startRes = await fetch('/run?key={{run_secret}}');
-        const startData = await startRes.json();
-        if (!startRes.ok && startRes.status !== 202) {
+        const res = await fetch('/run?key={{run_secret}}');
+        const data = await res.json();
+        if (res.ok) {
+          status.className = 'ok';
+          status.innerText = (data.message || 'Started!') + ' Check your email shortly.';
+        } else {
           status.className = 'err';
-          status.innerText = 'Error: ' + (startData.error || 'unknown error');
-          btn.disabled = false;
-          btn.innerText = 'Run Digest Now';
-          return;
+          status.innerText = 'Error: ' + (data.error || 'unknown error');
         }
-
-        btn.innerText = 'Running... (up to a few minutes)';
-        // Poll /status every few seconds until the background job finishes.
-        const poll = async () => {
-          const res = await fetch('/status?key={{run_secret}}');
-          const data = await res.json();
-          if (data.running) {
-            setTimeout(poll, 4000);
-            return;
-          }
-          if (data.last_error) {
-            status.className = 'err';
-            status.innerText = 'Error: ' + data.last_error;
-          } else if (data.last_result) {
-            status.className = 'ok';
-            status.innerText = 'Done! ' + (data.last_result.items_collected || 0) + ' items collected. Check your email.';
-          } else {
-            status.className = 'err';
-            status.innerText = 'No result found. Try again.';
-          }
-          btn.disabled = false;
-          btn.innerText = 'Run Digest Now';
-        };
-        setTimeout(poll, 4000);
       } catch (e) {
         status.className = 'err';
         status.innerText = 'Network error: ' + e.message;
+      } finally {
         btn.disabled = false;
         btn.innerText = 'Run Digest Now';
       }
@@ -461,30 +378,14 @@ def run_endpoint():
     if not RUN_SECRET or key != RUN_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
-    with job_lock:
-        if job_state["running"]:
-            return jsonify({"status": "already_running", "started_at": job_state["started_at"]}), 202
-        job_state["running"] = True
-        job_state["started_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-        job_state["last_result"] = None
-        job_state["last_error"] = None
+    def background_job():
+        try:
+            run_pipeline()
+        except Exception as e:
+            print(f"[error] pipeline failed: {e}")
 
-    thread = threading.Thread(target=_run_pipeline_in_background, daemon=True)
-    thread.start()
-
-    # Return immediately so the request never has a chance to hit Render's
-    # proxy timeout. The actual digest still gets fetched, summarized, and
-    # emailed in the background thread; check /status or your inbox.
-    return jsonify({"status": "started", "started_at": job_state["started_at"]}), 202
-
-
-@app.route("/status")
-def status_endpoint():
-    key = request.args.get("key")
-    if not RUN_SECRET or key != RUN_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-    with job_lock:
-        return jsonify(dict(job_state))
+    threading.Thread(target=background_job, daemon=True).start()
+    return jsonify({"status": "started", "message": "Pipeline running in background. Check your email in ~20-30 seconds."})
 
 
 if __name__ == "__main__":
