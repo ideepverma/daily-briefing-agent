@@ -206,15 +206,40 @@ def gather_all():
 # 3. SUMMARIZE with Groq (free tier: https://console.groq.com)
 # ---------------------------------------------------------------------------
 
-def build_prompt(digest_source):
+MAX_TITLE_LEN = 200
+MAX_LINK_LEN = 300
+MAX_PROMPT_CHARS = 14000  # keep well under Groq's request-size limit
+
+
+def _truncate(s, max_len):
+    s = s.strip()
+    return s if len(s) <= max_len else s[: max_len - 1].rstrip() + "…"
+
+
+def build_prompt(digest_source, char_budget=MAX_PROMPT_CHARS):
     lines = []
     for topic, items in digest_source.items():
         if not items:
             continue
         lines.append(f"### {topic}")
         for it in items:
-            lines.append(f"- {it['title']} ({it['link']})")
+            title = _truncate(it["title"], MAX_TITLE_LEN)
+            link = _truncate(it["link"], MAX_LINK_LEN)
+            lines.append(f"- {title} ({link})")
     raw_text = "\n".join(lines)
+
+    # Hard safety cap: even after per-field truncation, a large number of
+    # topics/items could still add up to more than the API will accept.
+    # Trim whole lines from the end rather than cutting mid-line/mid-URL.
+    if len(raw_text) > char_budget:
+        kept = []
+        total = 0
+        for line in raw_text.splitlines():
+            if total + len(line) + 1 > char_budget:
+                break
+            kept.append(line)
+            total += len(line) + 1
+        raw_text = "\n".join(kept)
 
     return f"""You are writing a concise daily research digest for a software engineer
 in India who follows AI, software engineering, system design, backend/Java/Spring Boot,
@@ -241,21 +266,34 @@ def summarize_with_groq(digest_source):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY environment variable not set.")
 
+    def call_groq(prompt):
+        resp = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 6000,
+            },
+            timeout=60,
+        )
+        return resp
+
     prompt = build_prompt(digest_source)
-    resp = requests.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 6000,
-        },
-        timeout=60,
-    )
+    resp = call_groq(prompt)
+
+    if resp.status_code == 413:
+        # Payload still too large (e.g. an unusually large batch of items) —
+        # retry once with a much smaller character budget instead of failing
+        # the whole run.
+        print("[warn] Groq returned 413, retrying with a smaller prompt")
+        smaller_prompt = build_prompt(digest_source, char_budget=MAX_PROMPT_CHARS // 2)
+        resp = call_groq(smaller_prompt)
+
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
