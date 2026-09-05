@@ -38,7 +38,7 @@ from email.mime.multipart import MIMEMultipart
 
 import feedparser
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
@@ -83,13 +83,33 @@ FEEDS = {
         "https://yourstory.com/feed",
         google_news_rss("India tech events innovation"),
     ],
+    "Digital Public Infrastructure & E-Governance": [
+        google_news_rss("Digital Public Infrastructure India"),
+        google_news_rss("e-governance India"),
+    ],
+    "Emerging Tech & Sovereign AI": [
+        google_news_rss("sovereign AI"),
+        google_news_rss("emerging technology India"),
+    ],
+    "Hardware, Manufacturing & Deep-Tech": [
+        google_news_rss("semiconductor manufacturing India"),
+        google_news_rss("deep tech hardware India"),
+    ],
+    "Startup Ecosystem, Innovation & R&D": [
+        google_news_rss("startup ecosystem R&D India"),
+        google_news_rss("innovation research India"),
+    ],
+    "Tech Regulation, Policy & Cyber Governance": [
+        google_news_rss("tech regulation policy India"),
+        google_news_rss("cyber governance India"),
+    ],
 }
 
-MAX_ITEMS_PER_TOPIC = 6
+MAX_ITEMS_PER_TOPIC = 4
 LOOKBACK_HOURS = 30
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
@@ -191,7 +211,7 @@ def summarize_with_groq(digest_source):
             "model": GROQ_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 2000,
+            "max_tokens": 6000,
         },
         timeout=60,
     )
@@ -257,8 +277,79 @@ def run_pipeline():
 # 6. FLASK ROUTES
 # ---------------------------------------------------------------------------
 
+HOME_PAGE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daily Briefing Agent</title>
+  <style>
+    body {
+      font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: #111; color: #eee; margin: 0;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; min-height: 100vh; padding: 24px; box-sizing: border-box;
+    }
+    h1 { font-size: 1.3rem; margin-bottom: 4px; text-align: center; }
+    p.sub { color: #999; margin-top: 0; margin-bottom: 28px; text-align: center; font-size: 0.9rem; }
+    button {
+      background: #2563eb; color: white; border: none; border-radius: 12px;
+      padding: 18px 32px; font-size: 1.1rem; font-weight: 600;
+      width: 100%; max-width: 320px; cursor: pointer;
+    }
+    button:disabled { background: #444; }
+    #status {
+      margin-top: 24px; font-size: 0.95rem; text-align: center;
+      max-width: 320px; white-space: pre-wrap;
+    }
+    .ok { color: #4ade80; }
+    .err { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>Daily Briefing Agent</h1>
+  <p class="sub">Tap below to fetch, summarize, and email today's digest</p>
+  <button id="runBtn" onclick="runNow()">Run Digest Now</button>
+  <div id="status"></div>
+
+  <script>
+    async function runNow() {
+      const btn = document.getElementById('runBtn');
+      const status = document.getElementById('status');
+      btn.disabled = true;
+      btn.innerText = 'Running... (10-20s)';
+      status.className = '';
+      status.innerText = '';
+      try {
+        const res = await fetch('/run?key={{run_secret}}');
+        const data = await res.json();
+        if (res.ok) {
+          status.className = 'ok';
+          status.innerText = 'Done! ' + (data.items_collected || 0) + ' items collected. Check your email.';
+        } else {
+          status.className = 'err';
+          status.innerText = 'Error: ' + (data.error || 'unknown error');
+        }
+      } catch (e) {
+        status.className = 'err';
+        status.innerText = 'Network error: ' + e.message;
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Run Digest Now';
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+
 @app.route("/")
 def health():
+    # Browsers get the button page; anything asking for JSON (like an uptime
+    # monitor) gets a plain health check instead.
+    if "text/html" in request.headers.get("Accept", ""):
+        return render_template_string(HOME_PAGE_HTML, run_secret=RUN_SECRET or "")
     return jsonify({"status": "alive", "service": "daily-briefing-agent"})
 
 
