@@ -136,6 +136,10 @@ RESEND_FROM_ADDRESS = "Daily Briefing Agent <onboarding@resend.dev>"
 
 SUBJECT_PREFIX = "[Daily Research Digest]"
 
+# Shared state so a watchdog thread can report exactly where the pipeline
+# got stuck, if it ever does. Simple dict is fine here — one run at a time.
+PIPELINE_STATE = {"stage": "idle", "started_at": None}
+
 # ---------------------------------------------------------------------------
 # 2. FETCH
 # ---------------------------------------------------------------------------
@@ -167,6 +171,12 @@ def _entries_to_items(entries):
         link = entry.get("link", "").strip()
         if not title or not link:
             continue
+        # Defensive cap: a malformed/broken feed can occasionally dump an
+        # entire article (or garbage) into the "title" field instead of a
+        # normal headline. Without a cap, one bad entry can balloon the
+        # whole prompt sent to Groq and trip its request-size limit (413).
+        if len(title) > 200:
+            title = title[:200].rsplit(" ", 1)[0] + "..."
         published = entry.get("published_parsed") or entry.get("updated_parsed")
         if published:
             pub_dt = datetime.datetime(*published[:6])
@@ -234,6 +244,14 @@ def build_prompt(digest_source):
         for it in items:
             lines.append(f"- {it['title']} ({it['link']})")
     raw_text = "\n".join(lines)
+
+    # Second safety net: even with per-title caps, many topics/items can add
+    # up. Hard-cap the total prompt size so a request can never trip Groq's
+    # payload-size limit (413) regardless of what the feeds throw at it.
+    MAX_PROMPT_CHARS = 8000
+    if len(raw_text) > MAX_PROMPT_CHARS:
+        print(f"  [warn] raw_text was {len(raw_text)} chars, truncating to {MAX_PROMPT_CHARS}")
+        raw_text = raw_text[:MAX_PROMPT_CHARS]
 
     return f"""You are writing a concise daily research digest for a software engineer
 in India who follows AI, software engineering, system design, backend/Java/Spring Boot,
@@ -335,17 +353,21 @@ def send_email(markdown_body):
 
 def run_pipeline():
     t0 = datetime.datetime.now()
+    PIPELINE_STATE["stage"] = "fetching"
     print(f"[{t0.strftime('%H:%M:%S')}] Pipeline started.")
     digest_source = gather_all()
     t1 = datetime.datetime.now()
     total_items = sum(len(v) for v in digest_source.values())
     print(f"[{t1.strftime('%H:%M:%S')}] Collected {total_items} raw items across {len(digest_source)} topics. (+{(t1-t0).total_seconds():.1f}s)")
+    PIPELINE_STATE["stage"] = "summarizing"
     digest_markdown = summarize_with_groq(digest_source)
     t2 = datetime.datetime.now()
     print(f"[{t2.strftime('%H:%M:%S')}] Groq summary done. (+{(t2-t1).total_seconds():.1f}s)")
+    PIPELINE_STATE["stage"] = "sending_email"
     send_email(digest_markdown)
     t3 = datetime.datetime.now()
     print(f"[{t3.strftime('%H:%M:%S')}] Email sent. (+{(t3-t2).total_seconds():.1f}s, total {(t3-t0).total_seconds():.1f}s)")
+    PIPELINE_STATE["stage"] = "done"
     return {"status": "ok", "items_collected": total_items}
 
 # ---------------------------------------------------------------------------
@@ -439,10 +461,40 @@ def run_endpoint():
             run_pipeline()
         except Exception as e:
             import traceback
+            PIPELINE_STATE["stage"] = f"failed: {e}"
             print(f"[error] pipeline failed: {e}")
             traceback.print_exc()
 
+    def watchdog(started_at):
+        WATCHDOG_TIMEOUT = 100
+        import time
+        time.sleep(WATCHDOG_TIMEOUT)
+        # If the pipeline is still on the SAME run (same start time) and
+        # hasn't reached "done" or "failed", it's genuinely stuck somewhere.
+        # Force-send a diagnostic email instead of leaving you with silence
+        # and no way to know what happened.
+        if PIPELINE_STATE.get("started_at") == started_at and PIPELINE_STATE["stage"] not in ("done",) and not str(PIPELINE_STATE["stage"]).startswith("failed"):
+            stuck_stage = PIPELINE_STATE["stage"]
+            print(f"[watchdog] pipeline still on '{stuck_stage}' after {WATCHDOG_TIMEOUT}s — sending diagnostic email")
+            try:
+                send_email(
+                    f"## Digest didn't complete normally\n\n"
+                    f"The pipeline was still stuck on **{stuck_stage}** after "
+                    f"{WATCHDOG_TIMEOUT} seconds and was abandoned.\n\n"
+                    f"This usually means Render's free-tier CPU was too "
+                    f"overloaded to finish in time. Check the Logs tab on "
+                    f"Render for more detail, or just try running it again."
+                )
+            except Exception as e:
+                print(f"[watchdog] couldn't even send the diagnostic email: {e}")
+
+    start_marker = datetime.datetime.now()
+    PIPELINE_STATE["stage"] = "starting"
+    PIPELINE_STATE["started_at"] = start_marker
+
     threading.Thread(target=background_job, daemon=True).start()
+    threading.Thread(target=watchdog, args=(start_marker,), daemon=True).start()
+
     return jsonify({"status": "started", "message": "Pipeline running in background. Check your email in ~20-30 seconds."})
 
 
